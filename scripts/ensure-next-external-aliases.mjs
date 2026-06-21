@@ -9,6 +9,7 @@ const nodeModulesDir = path.join(workspace, 'node_modules');
 
 const KNOWN_EXTERNALS = [
   { pattern: /^pg-[a-f0-9]{16,}$/i, packageName: 'pg' },
+  { pattern: /^@aws-sdk\/client-s3-[a-f0-9]{16,}$/i, packageName: '@aws-sdk/client-s3' },
   { pattern: /^@zvec\/zvec-[a-f0-9]{16,}$/i, packageName: '@zvec/zvec' },
 ];
 
@@ -40,7 +41,9 @@ async function ensureAlias(alias, packageName) {
   await mkdir(path.dirname(aliasPath), { recursive: true });
   await rm(aliasPath, { recursive: true, force: true });
   const relativeTarget = path.relative(path.dirname(aliasPath), targetPath) || '.';
-  await symlink(relativeTarget, aliasPath, 'dir');
+  const symlinkTarget = process.platform === 'win32' ? targetPath : relativeTarget;
+  const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+  await symlink(symlinkTarget, aliasPath, symlinkType);
   return { alias, packageName, aliasPath, targetPath };
 }
 
@@ -55,7 +58,7 @@ async function main() {
   const aliases = new Map();
   for (const file of await collectFiles(nextServerDir)) {
     const content = await readFile(file, 'utf8');
-    for (const match of content.matchAll(/(?:^|["'`])((?:@zvec\/zvec|pg)-[a-f0-9]{16,})(?=["'`])/gi)) {
+    for (const match of content.matchAll(/(?:^|["'`])((?:@aws-sdk\/client-s3|@zvec\/zvec|pg)-[a-f0-9]{16,})(?=["'`])/gi)) {
       const alias = match[1];
       const known = KNOWN_EXTERNALS.find(item => item.pattern.test(alias));
       if (known) aliases.set(alias, known.packageName);

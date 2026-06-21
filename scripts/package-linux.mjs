@@ -26,8 +26,8 @@ function copyEntry(relativePath, targetRelativePath = relativePath) {
     filter: sourcePath => {
       const normalized = sourcePath.replaceAll('\\', '/');
       if (normalized.includes('/node_modules/')) return false;
-      if (normalized.includes('/.next/cache/')) return false;
-      if (normalized.includes('/.next/dev/')) return false;
+      if (/\/\.next\/cache(?:\/|$)/.test(normalized)) return false;
+      if (/\/\.next\/dev(?:\/|$)/.test(normalized)) return false;
       if (normalized.includes('/.data/')) return false;
       if (normalized.includes('/.logs/')) return false;
       if (/\/public\/uploads(?:\/|$)/.test(normalized)) return false;
@@ -73,7 +73,7 @@ mkdirSync(appDir, { recursive: true });
   'package.json',
   'pnpm-lock.yaml',
   '.npmrc',
-  '.babelrc',
+  'babel.config.js',
   'next.config.ts',
   'tsconfig.json',
   'postcss.config.mjs',

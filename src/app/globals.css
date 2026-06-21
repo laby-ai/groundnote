@@ -1,0 +1,7 @@
+@import "katex/dist/katex.min.css";
+@import "tailwindcss";
+@import "../styles/global-core.css";
+@import "../styles/glass-components.css";
+@import "../styles/workbench-controls.css";
+@import "../styles/light-glass-overrides.css";
+@import "../styles/workbench-readability.css";

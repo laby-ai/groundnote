@@ -1,0 +1,268 @@
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import process from 'node:process';
+import { chromium } from '@playwright/test';
+
+const workspace = process.cwd();
+const startupTimeoutMs = Number(process.env.STUDIO_EVIDENCE_UI_TIMEOUT_MS || 45_000);
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.close(() => {
+        if (!address || typeof address === 'string') {
+          reject(new Error('Unable to allocate a local Studio evidence smoke app port.'));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+  });
+}
+
+async function waitForHealth(origin, child) {
+  const deadline = Date.now() + startupTimeoutMs;
+  let lastError = '';
+  while (Date.now() < deadline) {
+    if (child?.exitCode !== null && child?.exitCode !== undefined) {
+      throw new Error(`Studio evidence smoke app exited before /api/health completed with code ${child.exitCode}.`);
+    }
+    try {
+      const response = await fetch(`${origin}/api/health`, { cache: 'no-store' });
+      const body = await response.json();
+      if (response.ok && body.ok === true) return body;
+      lastError = `HTTP ${response.status}: ${JSON.stringify(body)}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  throw new Error(`Timed out waiting for /api/health at ${origin}. Last error: ${lastError}`);
+}
+
+function killProcessTree(child) {
+  if (!child?.pid || child.exitCode !== null) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' });
+    return;
+  }
+  child.kill('SIGTERM');
+}
+
+async function resolveSmokeApp(tempDir) {
+  if (process.env.APP_ORIGIN?.trim()) {
+    return { appOrigin: process.env.APP_ORIGIN.trim(), child: undefined, managed: false };
+  }
+  const port = await findFreePort();
+  const appOrigin = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, ['scripts/dev.mjs'], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      DEPLOY_RUN_PORT: String(port),
+      INTERNAL_APP_ORIGIN: '',
+      SOURCE_STORE_PATH: path.join(tempDir, 'sources.json'),
+      ZVEC_STORE_PATH: path.join(tempDir, 'zvec'),
+      ALLOW_INSECURE_API_BASE: 'true',
+      ALLOW_PRIVATE_API_BASE: 'true',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+
+  const output = [];
+  child.stdout.on('data', chunk => output.push(String(chunk)));
+  child.stderr.on('data', chunk => output.push(String(chunk)));
+
+  try {
+    await waitForHealth(appOrigin, child);
+    return { appOrigin, child, managed: true, output };
+  } catch (error) {
+    const recentOutput = output.join('').slice(-4000);
+    if (recentOutput) console.error(recentOutput);
+    killProcessTree(child);
+    throw error;
+  }
+}
+
+async function expectVisible(locator, message, timeout = 15_000) {
+  await locator.waitFor({ state: 'visible', timeout }).catch(error => {
+    throw new Error(`${message}: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
+function sse(lines) {
+  return lines.map(line => `data: ${line}\n\n`).join('');
+}
+
+async function interceptUpload(page) {
+  let hitCount = 0;
+  await page.route('**/api/upload', async route => {
+    hitCount += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        results: [{
+          id: 'studio-evidence-source',
+          title: 'Studio Evidence Source',
+          authors: ['Smoke Test'],
+          year: 2026,
+          keywords: ['citation', 'grounded-context'],
+          abstract: 'Source for validating visible citations in Studio outputs.',
+          content: '右侧知识卡片和中心综述报告必须展示 grounded retrieval、引用来源和引用编号审计。',
+          rawContent: '第 4 页：Studio outputs should show citations, retrieval mode, and citation audit status.',
+          shortName: 'EvidenceUI',
+          fileName: 'studio-evidence.txt',
+          fileType: 'txt',
+          fileSize: 240,
+          uploadTime: new Date().toISOString(),
+          ingestionStatus: 'succeeded',
+          ingestionStages: [{ name: 'chunk', status: 'succeeded' }],
+          ingestionChunkCount: 1,
+          vectorIndex: { status: 'not_configured', count: 0 },
+          mineruFigures: [],
+        }],
+      }),
+    });
+  });
+  return () => hitCount;
+}
+
+async function interceptReport(page) {
+  let hitCount = 0;
+  await page.route('**/api/ai/report', async route => {
+    hitCount += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: sse([
+        '{"citations":[{"paperId":"studio-evidence-source","paperShortName":"EvidenceUI","sourceId":"studio-evidence-source","chunkId":"studio-evidence-source-c1","sourceTitle":"Studio Evidence Source","excerpt":"Studio outputs should show citations, retrieval mode, and citation audit status.","score":1,"page":4}],"retrieval":{"mode":"persisted-keyword","persistedSourceCount":1,"vectorIndexedSourceCount":0}}',
+        '{"content":"# 综述报告\\n\\n核心结论必须能追溯到来源[1]。"}',
+        '{"citationAudit":{"status":"pass","citedNumbers":[1],"invalidNumbers":[],"uncitedNumbers":[],"citationCount":1,"markerCount":1}}',
+        '[DONE]',
+      ]),
+    });
+  });
+  return () => hitCount;
+}
+
+async function interceptKnowledgeCards(page) {
+  let hitCount = 0;
+  await page.route('**/api/ai/knowledge-cards', async route => {
+    hitCount += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        cards: [{
+          category: '核心发现',
+          title: 'Studio 产物为什么要显示证据状态？',
+          content: '用户需要知道知识卡片来自哪段资料、当前使用的是持久片段检索还是向量索引检索，否则右侧产物会像无来源生成物[1]。',
+          extra: '来源: [1] studio-evidence-source-c1, page 4',
+        }],
+        citations: [{
+          paperId: 'studio-evidence-source',
+          paperShortName: 'EvidenceUI',
+          sourceId: 'studio-evidence-source',
+          chunkId: 'studio-evidence-source-c1',
+          sourceTitle: 'Studio Evidence Source',
+          excerpt: 'Studio outputs should show citations, retrieval mode, and citation audit status.',
+          score: 1,
+          page: 4,
+        }],
+        retrieval: { mode: 'persisted-keyword', persistedSourceCount: 1, vectorIndexedSourceCount: 0 },
+        citationAudit: { status: 'pass', citedNumbers: [1], invalidNumbers: [], uncitedNumbers: [], citationCount: 1, markerCount: 1 },
+      }),
+    });
+  });
+  return () => hitCount;
+}
+
+async function main() {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'lingbi-studio-evidence-ui-'));
+  const uploadPath = path.join(tempDir, 'studio-evidence.txt');
+  await writeFile(uploadPath, 'Studio evidence UI smoke source.', 'utf8');
+
+  let smokeApp;
+  let browser;
+  try {
+    smokeApp = await resolveSmokeApp(tempDir);
+    const { appOrigin } = smokeApp;
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+
+    const uploadHits = await interceptUpload(page);
+    const reportHits = await interceptReport(page);
+    const cardHits = await interceptKnowledgeCards(page);
+
+    await page.goto(`${appOrigin}/#workbench`, { waitUntil: 'networkidle' });
+    await expectVisible(page.getByText('Studio', { exact: true }), 'Workbench Studio panel did not render.');
+    await page.locator('input[type="file"]').setInputFiles(uploadPath);
+    await expectVisible(page.getByText('已选 1 篇'), 'Uploaded source was not selected.');
+
+    await page.getByRole('button', { name: '生成综述报告' }).click();
+    await expectVisible(page.getByText('引用编号已对齐'), 'Report citation audit badge did not render.');
+    await expectVisible(page.getByText(/持久片段检索 · 引用 1/), 'Report retrieval badge did not render.');
+    await expectVisible(page.getByText('1 个引用来源'), 'Report citation source toggle did not render.');
+    await page.getByText('1 个引用来源').click();
+    await expectVisible(page.getByText('Studio Evidence Source').first(), 'Report citation source detail did not render.');
+
+    await page.getByRole('button', { name: '知识卡片' }).click();
+    await page.getByRole('button', { name: '生成知识卡片' }).click();
+    await expectVisible(page.getByText('Studio 产物为什么要显示证据状态？'), 'Knowledge-card content did not render.');
+    await expectVisible(page.getByText('证据状态', { exact: true }), 'Knowledge-card evidence status did not render.');
+    await expectVisible(page.getByTestId('knowledge-retrieval-badge'), 'Knowledge-card retrieval badge did not render.');
+    await expectVisible(page.getByTestId('knowledge-citation-audit-badge'), 'Knowledge-card citation audit badge did not render.');
+    await expectVisible(page.getByText('引用编号通过 · 1/1'), 'Knowledge-card citation audit status did not render.');
+    await expectVisible(page.getByText('1 个引用来源').last(), 'Knowledge-card citation source count did not render.');
+    await expectVisible(page.getByText(/EvidenceUI · 第 4 页/).last(), 'Knowledge-card citation page did not render.');
+
+    const bodyText = await page.locator('body').innerText();
+    const testKeyPrefix = ['sk', 'test'].join('-');
+    const arkKeyPrefix = ['ark', 'test'].join('-');
+    assert(!bodyText.includes(testKeyPrefix) && !bodyText.includes(arkKeyPrefix), 'Visible Studio evidence UI leaked a test-looking API key.');
+
+    console.log(JSON.stringify({
+      ok: true,
+      appOrigin,
+      managedApp: smokeApp.managed,
+      checked: [
+        'uploaded source becomes selected',
+        'central report renders citation audit badge',
+        'central report renders retrieval badge',
+        'central report citation source can expand',
+        'knowledge cards render generated card',
+        'knowledge cards render evidence status and retrieval badge',
+        'knowledge cards render citation audit status',
+        'knowledge cards render citation source snippet/page',
+        'visible evidence UI does not leak API keys',
+      ],
+      requests: {
+        upload: uploadHits(),
+        report: reportHits(),
+        knowledgeCards: cardHits(),
+      },
+    }, null, 2));
+  } finally {
+    await browser?.close().catch(() => undefined);
+    killProcessTree(smokeApp?.child);
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+main().catch(error => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});

@@ -1,0 +1,908 @@
+'use client';
+
+import { useState, useCallback, useRef, useEffect, DragEvent } from 'react';
+import {
+  FolderPlus,
+  Trash2,
+  CheckCircle2,
+  Circle,
+  Search,
+  ChevronDown,
+  Copy,
+  FileText,
+  Upload,
+  FileImage,
+  FileSpreadsheet,
+  File,
+  Presentation,
+  X,
+  CheckCircle,
+  AlertCircle,
+  Loader2,
+  MoreHorizontal,
+  ClipboardPaste,
+  Globe2,
+} from 'lucide-react';
+import { useApp } from '@/contexts/AppContext';
+import type { Paper, FileType } from '@/types';
+
+const SUPPORTED_TYPES: Record<string, FileType> = {
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'text/plain': 'txt',
+  'text/markdown': 'md',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'text/csv': 'csv',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-excel': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+};
+
+const ACCEPT_STRING = '.pdf,.doc,.docx,.txt,.md,.jpg,.jpeg,.png,.gif,.webp,.csv,.xlsx,.ppt,.pptx';
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function FileTypeIcon({ fileType }: { fileType: FileType }) {
+  const cls = 'h-4 w-4 flex-shrink-0';
+  switch (fileType) {
+    case 'pdf': return <FileText className={`${cls} text-red-400`} />;
+    case 'doc': case 'docx': return <FileText className={`${cls} text-blue-400`} />;
+    case 'txt': case 'md': return <FileText className={`${cls} text-[var(--text-tertiary)]`} />;
+    case 'jpg': case 'jpeg': case 'png': case 'gif': case 'webp': return <FileImage className={`${cls} text-emerald-400`} />;
+    case 'csv': case 'xlsx': return <FileSpreadsheet className={`${cls} text-teal-400`} />;
+    case 'ppt': case 'pptx': return <Presentation className={`${cls} text-amber-400`} />;
+    default: return <File className={`${cls} text-zinc-500`} />;
+  }
+}
+
+function fileTypeBadgeStyle(fileType: FileType): string {
+  const map: Record<string, string> = {
+    pdf: 'bg-red-500/10 text-red-400 border-red-500/20',
+    doc: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+    docx: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+    txt: 'bg-[var(--glass-hover)] text-[var(--text-secondary)] border-[var(--border-subtle)]',
+    md: 'bg-[var(--glass-hover)] text-[var(--text-secondary)] border-[var(--border-subtle)]',
+    jpg: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    jpeg: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    png: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    gif: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    webp: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+    csv: 'bg-teal-500/10 text-teal-400 border-teal-500/20',
+    xlsx: 'bg-teal-500/10 text-teal-400 border-teal-500/20',
+    ppt: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+    pptx: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  };
+  return map[fileType] || 'bg-[var(--glass-hover)] text-[var(--text-secondary)] border-[var(--border-subtle)]';
+}
+
+interface UploadItem {
+  id: string;
+  fileName: string;
+  fileType: FileType;
+  fileSize: number;
+  status: 'pending' | 'uploading' | 'success' | 'error';
+  progress: number;
+  error?: string;
+  paper?: Paper;
+}
+
+interface IngestionSourceSummary {
+  id: string;
+  fileName: string;
+  fileType: FileType;
+  fileSize?: number;
+  title: string;
+  shortName?: string;
+  status: Paper['ingestionStatus'];
+  stages?: Paper['ingestionStages'];
+  chunkCount: number;
+  tokenEstimate: number;
+  vectorIndex: Paper['vectorIndex'];
+  mineru?: Paper['mineru'];
+  createdAt?: string;
+  updatedAt: string;
+  error?: string;
+}
+
+interface IngestionSourceDetail extends IngestionSourceSummary {
+  chunks?: Array<{ text?: string }>;
+}
+
+function legacyMinerUStatus(mineru?: Paper['mineru']): Paper['mineruStatus'] | undefined {
+  if (!mineru || mineru.status === 'not_configured') return undefined;
+  if (mineru.status === 'succeeded') return 'done';
+  if (mineru.status === 'running' || mineru.status === 'pending') return mineru.status;
+  return 'failed';
+}
+
+function ingestionBadge(paper: Paper): { label: string; className: string } | null {
+  if (!paper.ingestionStatus) return null;
+  if (paper.ingestionStatus === 'succeeded') {
+    const indexed = paper.vectorIndex?.status === 'succeeded';
+    return {
+      label: indexed ? `索引 ${paper.vectorIndex?.count || paper.ingestionChunkCount || 0}` : `片段 ${paper.ingestionChunkCount || 0}`,
+      className: indexed
+        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+        : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20',
+    };
+  }
+  if (paper.ingestionStatus === 'running' || paper.ingestionStatus === 'pending') {
+    return { label: '索引中', className: 'bg-blue-500/10 text-blue-400 border-blue-500/20' };
+  }
+  return { label: '索引失败', className: 'bg-red-500/10 text-red-400 border-red-500/20' };
+}
+
+function mineruBadge(paper: Paper): { label: string; className: string } | null {
+  if (paper.fileType !== 'pdf' || !paper.mineru || paper.mineru.status === 'not_configured') return null;
+  if (paper.mineru.status === 'succeeded') {
+    return {
+      label: `图表 ${paper.mineru.figureCount || paper.mineruFigures?.length || 0}`,
+      className: 'bg-violet-500/10 text-violet-300 border-violet-500/20',
+    };
+  }
+  if (paper.mineru.status === 'pending' || paper.mineru.status === 'running') {
+    return { label: '图表提取中', className: 'bg-blue-500/10 text-blue-300 border-blue-500/20' };
+  }
+  return { label: '图表失败', className: 'bg-red-500/10 text-red-400 border-red-500/20' };
+}
+
+function sourceSortTime(paper: Paper): number {
+  const value = paper.uploadTime || '';
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : 0;
+}
+
+export function LibraryPanel({
+  workspaceTitle = '默认资料工作台',
+  onBackHome,
+  showSourceGuide = false,
+  onSourceGuideDismiss,
+}: {
+  workspaceTitle?: string;
+  onBackHome?: () => void;
+  showSourceGuide?: boolean;
+  onSourceGuideDismiss?: () => void;
+}) {
+  const {
+    folders,
+    selectedPapers,
+    activeFolderId,
+    addFolder,
+    deleteFolder,
+    addPaper,
+    updatePaper,
+    togglePaperSelection,
+    selectAllPapers,
+    clearSelection,
+    setActiveFolder,
+    aiConfig,
+  } = useApp();
+
+  const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [uploadItems, setUploadItems] = useState<UploadItem[]>([]);
+  const [showUploadProgress, setShowUploadProgress] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; paper: Paper } | null>(null);
+  const [ingestionSyncState, setIngestionSyncState] = useState<'idle' | 'syncing' | 'error'>('idle');
+  const [isSourceGuideOpen, setIsSourceGuideOpen] = useState(showSourceGuide);
+  const [pastedSourceText, setPastedSourceText] = useState('');
+  const [pastedSourceTitle, setPastedSourceTitle] = useState('');
+  const ingestionSyncInFlightRef = useRef(false);
+  const lastIngestionSyncAtRef = useRef(0);
+
+  useEffect(() => {
+    if (showSourceGuide) setIsSourceGuideOpen(true);
+  }, [showSourceGuide]);
+
+  const syncIngestionSources = useCallback(async () => {
+    const now = Date.now();
+    if (ingestionSyncInFlightRef.current || now - lastIngestionSyncAtRef.current < 5000) return;
+    ingestionSyncInFlightRef.current = true;
+    lastIngestionSyncAtRef.current = now;
+    const knownPapers = new Map<string, Paper>();
+    folders.forEach(folder => folder.papers.forEach(paper => knownPapers.set(paper.id, paper)));
+
+    try {
+      setIngestionSyncState('syncing');
+      const response = await fetch('/api/ingestion/sources', { cache: 'no-store' });
+      if (!response.ok) throw new Error('ingestion sources request failed');
+      const data = await response.json() as { sources?: IngestionSourceSummary[] };
+      const sources = data.sources || [];
+
+      const missingSources = sources.filter(source => !knownPapers.has(source.id));
+      let importFolderId = activeFolderId || folders[0]?.id || null;
+      if (missingSources.length > 0 && !importFolderId) {
+        importFolderId = addFolder('资料库');
+        setExpandedFolders(prev => new Set([...prev, importFolderId!]));
+        setActiveFolder(importFolderId);
+      }
+
+      for (const source of missingSources) {
+        if (!importFolderId) continue;
+        const detailResponse = await fetch(`/api/ingestion/sources?id=${encodeURIComponent(source.id)}`, { cache: 'no-store' });
+        if (!detailResponse.ok) continue;
+        const detailData = await detailResponse.json() as { source?: IngestionSourceDetail };
+        const detail = detailData.source;
+        if (!detail) continue;
+        const rawContent = (detail.chunks || [])
+          .map(chunk => chunk.text || '')
+          .filter(Boolean)
+          .join('\n\n')
+          .slice(0, 50000);
+        addPaper(importFolderId, {
+          id: detail.id,
+          title: detail.title || detail.fileName,
+          authors: ['已入库资料'],
+          year: new Date(detail.createdAt || detail.updatedAt || Date.now()).getFullYear(),
+          keywords: ['持久资料'],
+          abstract: rawContent.slice(0, 240) || `${detail.title || detail.fileName} 已完成资料摄取。`,
+          content: rawContent || `${detail.title || detail.fileName} 已完成资料摄取。`,
+          rawContent,
+          shortName: detail.shortName || detail.fileName,
+          fileName: detail.fileName,
+          fileType: detail.fileType,
+          fileSize: detail.fileSize || 0,
+          uploadTime: detail.createdAt || detail.updatedAt || new Date().toISOString(),
+          mineru: detail.mineru,
+          mineruStatus: legacyMinerUStatus(detail.mineru),
+          ingestionStatus: detail.status,
+          ingestionStages: detail.stages,
+          ingestionChunkCount: detail.chunkCount,
+          vectorIndex: detail.vectorIndex,
+          mineruFigures: [],
+        });
+        knownPapers.set(detail.id, {
+          id: detail.id,
+          title: detail.title || detail.fileName,
+          authors: ['已入库资料'],
+          year: new Date().getFullYear(),
+          keywords: ['持久资料'],
+          abstract: rawContent.slice(0, 240),
+          content: rawContent,
+          rawContent,
+          shortName: detail.shortName || detail.fileName,
+          fileName: detail.fileName,
+          fileType: detail.fileType,
+          fileSize: detail.fileSize || 0,
+          uploadTime: detail.createdAt || detail.updatedAt || new Date().toISOString(),
+          mineruFigures: [],
+        });
+      }
+
+      for (const source of data.sources || []) {
+        const current = knownPapers.get(source.id);
+        if (!current) continue;
+        const nextVectorIndex = source.vectorIndex;
+        const changed = (
+          current.ingestionStatus !== source.status ||
+          current.ingestionChunkCount !== source.chunkCount ||
+          current.mineru?.status !== source.mineru?.status ||
+          current.mineru?.figureCount !== source.mineru?.figureCount ||
+          current.vectorIndex?.status !== nextVectorIndex?.status ||
+          current.vectorIndex?.count !== nextVectorIndex?.count ||
+          current.vectorIndex?.dimension !== nextVectorIndex?.dimension
+        );
+        if (changed) {
+          updatePaper(source.id, {
+            ingestionStatus: source.status,
+            ingestionStages: source.stages,
+            ingestionChunkCount: source.chunkCount,
+            mineru: source.mineru,
+            mineruStatus: legacyMinerUStatus(source.mineru),
+            vectorIndex: nextVectorIndex,
+          });
+        }
+      }
+      setIngestionSyncState('idle');
+    } catch {
+      setIngestionSyncState('error');
+    } finally {
+      ingestionSyncInFlightRef.current = false;
+    }
+  }, [activeFolderId, addFolder, addPaper, folders, setActiveFolder, updatePaper]);
+
+  useEffect(() => {
+    void syncIngestionSources();
+    const interval = window.setInterval(() => {
+      void syncIngestionSources();
+    }, 15000);
+    return () => window.clearInterval(interval);
+  }, [folders.length, syncIngestionSources]);
+
+  const handleCreateFolder = useCallback(() => {
+    if (newFolderName.trim()) {
+      const newFolderId = addFolder(newFolderName.trim());
+      setExpandedFolders(prev => new Set([...prev, newFolderId]));
+      setActiveFolder(newFolderId);
+      setNewFolderName('');
+      setIsCreatingFolder(false);
+    }
+  }, [newFolderName, addFolder]);
+
+  const uploadFiles = useCallback(async (files: File[], targetFolderId: string | null) => {
+    if (!files.length) return;
+    if (!targetFolderId) return;
+
+    const items: UploadItem[] = files.map((file, idx) => {
+      const ext = file.name.split('.').pop()?.toLowerCase() || '';
+      const fileType = (Object.values(SUPPORTED_TYPES).includes(ext as FileType) ? ext : 'other') as FileType;
+      return {
+        id: `upload-${Date.now()}-${idx}`,
+        fileName: file.name,
+        fileType,
+        fileSize: file.size,
+        status: 'pending' as const,
+        progress: 0,
+      };
+    });
+
+    setUploadItems(items);
+    setShowUploadProgress(true);
+    setUploadItems(prev => prev.map(item => ({ ...item, status: 'uploading' as const, progress: 30 })));
+
+    try {
+      const formData = new FormData();
+      files.forEach(file => formData.append('files', file));
+      formData.append('aiConfig', JSON.stringify(aiConfig));
+
+      const response = await fetch('/api/upload', { method: 'POST', body: formData });
+      if (!response.ok) throw new Error('上传失败');
+      const data = await response.json();
+
+      // Collect papers first, then batch add outside setState
+      const uploadedPapers: Paper[] = [];
+      const newUploadItems = items.map((item, idx) => {
+        const result = data.results?.[idx];
+        if (result?.error) return { ...item, status: 'error' as const, progress: 100, error: result.error };
+        if (result) {
+          const paper: Paper = {
+            id: result.id, title: result.title, authors: result.authors, year: result.year,
+            keywords: result.keywords, abstract: result.abstract, content: result.content,
+            rawContent: result.rawContent,
+            shortName: result.shortName, fileName: result.fileName, fileType: result.fileType,
+            fileSize: result.fileSize, fileUrl: result.fileUrl, fileKey: result.fileKey,
+            uploadTime: result.uploadTime,
+            mineruFigures: result.mineruFigures || [],
+            mineruStatus: result.mineruStatus,
+            mineru: result.mineru,
+            ingestionStatus: result.ingestionStatus,
+            ingestionStages: result.ingestionStages,
+            ingestionChunkCount: result.ingestionChunkCount,
+            vectorIndex: result.vectorIndex,
+          };
+          uploadedPapers.push(paper);
+          return { ...item, status: 'success' as const, progress: 100, paper };
+        }
+        return { ...item, status: 'error' as const, progress: 100, error: '未知错误' };
+      });
+
+      // First update upload items, then add papers separately (avoids setState during render)
+      setUploadItems(newUploadItems);
+      uploadedPapers.forEach(paper => {
+        addPaper(targetFolderId, paper);
+        // Auto-select uploaded papers so AI can reference them immediately
+        setTimeout(() => togglePaperSelection(paper.id), 0);
+      });
+      setTimeout(() => { void syncIngestionSources(); }, 0);
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : '上传失败';
+      setUploadItems(prev => prev.map(item => ({ ...item, status: 'error' as const, progress: 100, error: errorMsg })));
+    }
+  }, [addPaper, togglePaperSelection, aiConfig, syncIngestionSources]);
+
+  const handleFileSelect = useCallback(async (fileList: FileList | null) => {
+    if (!fileList) return;
+    const files = Array.from(fileList);
+    const validFiles = files.filter(file => {
+      const ext = file.name.split('.').pop()?.toLowerCase() || '';
+      return Object.values(SUPPORTED_TYPES).includes(ext as FileType) || Object.keys(SUPPORTED_TYPES).includes(file.type);
+    });
+    if (validFiles.length === 0) {
+      setUploadItems([]);
+      setShowUploadProgress(false);
+      return;
+    }
+    if (!activeFolderId) {
+      // Schedule folder creation + upload after current render
+      setTimeout(async () => {
+        const newFolderId = addFolder('新建项目');
+        setExpandedFolders(prev => new Set([...prev, newFolderId]));
+        await uploadFiles(validFiles, newFolderId);
+      }, 0);
+      return;
+    }
+    await uploadFiles(validFiles, activeFolderId);
+  }, [activeFolderId, uploadFiles, addFolder]);
+
+  const dismissSourceGuide = useCallback(() => {
+    setIsSourceGuideOpen(false);
+    onSourceGuideDismiss?.();
+  }, [onSourceGuideDismiss]);
+
+  const openFilePickerFromGuide = useCallback(() => {
+    dismissSourceGuide();
+    window.setTimeout(() => fileInputRef.current?.click(), 0);
+  }, [dismissSourceGuide]);
+
+  const handlePasteTextAsSource = useCallback(async () => {
+    const content = pastedSourceText.trim();
+    if (!content) return;
+    const title = (pastedSourceTitle.trim() || '粘贴文本资料').replace(/[\\/:*?"<>|]/g, '-').slice(0, 80);
+    const file = new globalThis.File([content], `${title}.txt`, { type: 'text/plain' });
+    let targetFolder = activeFolderId;
+    if (!targetFolder) {
+      targetFolder = addFolder('资料库');
+      setExpandedFolders(prev => new Set([...prev, targetFolder!]));
+      setActiveFolder(targetFolder);
+    }
+    dismissSourceGuide();
+    setPastedSourceText('');
+    setPastedSourceTitle('');
+    await uploadFiles([file], targetFolder);
+  }, [activeFolderId, addFolder, dismissSourceGuide, pastedSourceText, pastedSourceTitle, setActiveFolder, uploadFiles]);
+
+  const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  }, []);
+
+  const handleDrop = useCallback(async (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    let targetFolder = activeFolderId;
+    if (!targetFolder) {
+      const newFolderId = addFolder('新建项目');
+      setExpandedFolders(prev => new Set([...prev, newFolderId]));
+      targetFolder = newFolderId;
+    }
+    if (targetFolder) await uploadFiles(files, targetFolder);
+  }, [activeFolderId, uploadFiles, addFolder]);
+
+  const handleFolderClick = useCallback((folderId: string) => {
+    setActiveFolder(folderId);
+    setExpandedFolders(prev => {
+      const next = new Set(prev);
+      if (next.has(folderId)) next.delete(folderId); else next.add(folderId);
+      return next;
+    });
+  }, [setActiveFolder]);
+
+  const copyShortName = useCallback((paper: Paper) => {
+    navigator.clipboard.writeText(`[${paper.shortName}]`);
+    setContextMenu(null);
+  }, []);
+
+  const handleContextMenu = useCallback((e: React.MouseEvent, paper: Paper) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY, paper });
+  }, []);
+
+  const filteredFolders = folders.map(folder => ({
+    ...folder,
+    papers: folder.papers.filter(paper =>
+      paper.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      paper.authors.some(a => a.toLowerCase().includes(searchQuery.toLowerCase())) ||
+      paper.keywords.some(k => k.toLowerCase().includes(searchQuery.toLowerCase()))
+    ).toSorted((a, b) => sourceSortTime(b) - sourceSortTime(a)),
+  })).filter(folder => folder.papers.length > 0 || folder.name.toLowerCase().includes(searchQuery.toLowerCase()));
+
+  const totalPapers = folders.reduce((sum, f) => sum + f.papers.length, 0);
+
+  return (
+    <div
+      className="h-full flex flex-col relative"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      onClick={() => setContextMenu(null)}
+    >
+      {/* Drag overlay */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-50 bg-blue-500/5 border-2 border-dashed border-blue-500/30 rounded-2xl flex items-center justify-center backdrop-blur-sm">
+          <div className="text-center animate-scale-in">
+            <Upload className="h-10 w-10 text-blue-400 mx-auto mb-3 animate-float" />
+            <p className="text-sm font-medium text-[var(--text-primary)]">释放文件以上传</p>
+            <p className="text-xs text-zinc-500 mt-1">PDF / Word / 图片 / Excel / PPT / TXT</p>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="px-5 pt-5 pb-4 border-b border-[var(--border-subtle)]">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 overflow-hidden rounded-xl border border-[var(--border-medium)] bg-[var(--bg-card)] shadow-sm">
+              <img
+                src="/assets/brand/lingbi-mark.svg"
+                alt=""
+                aria-hidden="true"
+                className="h-full w-full object-cover"
+              />
+            </div>
+            <div>
+              <h2 className="max-w-[150px] truncate text-base font-semibold tracking-tight text-[var(--text-primary)]">{workspaceTitle}</h2>
+              <p className="text-[11px] text-[var(--text-tertiary)] mt-0.5">
+                {totalPapers} 个来源{ingestionSyncState === 'syncing' ? ' · 同步中' : ingestionSyncState === 'error' ? ' · 状态同步失败' : ''}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {onBackHome && (
+              <button
+                type="button"
+                onClick={onBackHome}
+                className="min-w-[44px] whitespace-nowrap rounded-xl liquid-glass-btn px-2.5 py-2 text-[11px]"
+                aria-label="返回资料工作台首页"
+              >
+                全部
+              </button>
+            )}
+            <button
+              onClick={() => setIsCreatingFolder(true)}
+              className="w-8 h-8 rounded-xl liquid-glass-btn !p-0 flex items-center justify-center"
+              aria-label="新建资料分组"
+            >
+              <FolderPlus className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Search */}
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-zinc-600" />
+          <input
+            type="text"
+            placeholder="搜索资料..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="liquid-glass-input pl-9 text-xs"
+          />
+        </div>
+      </div>
+
+      {/* Selection bar */}
+      {selectedPapers.length > 0 && (
+        <div
+          data-testid="library-selection-count"
+          className="px-5 py-2.5 bg-blue-500/[0.06] border-b border-blue-500/10 flex items-center justify-between animate-fade-in"
+        >
+          <span className="text-xs font-medium text-blue-400">
+            已选 {selectedPapers.length} 个来源
+          </span>
+          <button onClick={clearSelection} className="btn-ghost text-xs text-[var(--accent-blue)] hover:opacity-80 py-1 px-2">
+            <X className="h-3 w-3" /> 清除
+          </button>
+        </div>
+      )}
+
+      {/* Upload progress */}
+      {showUploadProgress && uploadItems.length > 0 && (
+        <div className="px-5 py-3 border-b border-[var(--border-subtle)] bg-[var(--bg-card)] space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="section-label">上传进度</span>
+            <button
+              onClick={() => {
+                if (uploadItems.every(i => i.status !== 'uploading')) {
+                  setShowUploadProgress(false);
+                  setUploadItems([]);
+                }
+              }}
+              className="text-[10px] text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              {uploadItems.every(i => i.status !== 'uploading') ? '关闭' : '隐藏'}
+            </button>
+          </div>
+          {uploadItems.map(item => (
+            <div key={item.id} className="flex items-center gap-2.5 text-xs py-1">
+              {item.status === 'uploading' && <Loader2 className="h-3 w-3 animate-spin text-blue-400" />}
+              {item.status === 'success' && <CheckCircle className="h-3 w-3 text-emerald-400" />}
+              {item.status === 'error' && <AlertCircle className="h-3 w-3 text-red-400" />}
+              {item.status === 'pending' && <Circle className="h-3 w-3 text-zinc-600" />}
+              <span className="truncate flex-1 text-[var(--text-secondary)]">{item.fileName}</span>
+              <span className={`
+                ${item.status === 'success' ? 'text-emerald-400' : ''}
+                ${item.status === 'error' ? 'text-red-400' : ''}
+                ${item.status === 'uploading' ? 'text-blue-400' : ''}
+                ${item.status === 'pending' ? 'text-zinc-600' : ''}
+              `}>
+                {item.status === 'uploading' ? '上传中...' : item.status === 'success' ? '完成' : item.status === 'error' ? '失败' : '等待'}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Paper list */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2">
+        {filteredFolders.length === 0 ? (
+          <div className="text-center py-16">
+            <div className="w-16 h-16 rounded-2xl liquid-glass-inset flex items-center justify-center mx-auto mb-4">
+              <FileText className="h-7 w-7 text-zinc-700" />
+            </div>
+            <p className="text-sm text-zinc-500 font-medium">暂无资料</p>
+            <p className="text-xs text-zinc-600 mt-1.5">拖拽文件到此处，或点击下方上传</p>
+          </div>
+        ) : (
+          filteredFolders.map((folder) => (
+            <div key={folder.id} className="mb-2">
+              {/* Folder header */}
+              <div
+                className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer transition-all duration-300 group ${
+                  activeFolderId === folder.id ? 'bg-[var(--glass-subtle)]' : 'hover:bg-[var(--glass-subtle)]'
+                }`}
+                onClick={() => handleFolderClick(folder.id)}
+              >
+                <ChevronDown className={`h-3.5 w-3.5 text-zinc-500 transition-transform duration-300 ${!expandedFolders.has(folder.id) ? '-rotate-90' : ''}`} />
+                <FolderPlus className="h-4 w-4 text-blue-400" />
+                <span className="flex-1 truncate text-sm font-medium text-[var(--text-primary)]">{folder.name}</span>
+                <span className="text-[10px] text-zinc-600 tabular-nums">{folder.papers.length}</span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); selectAllPapers(folder.id); }}
+                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded-lg bg-[var(--bg-card)] flex items-center justify-center text-zinc-500 hover:text-[var(--text-primary)] transition-all"
+                  title="全选"
+                >
+                  <CheckCircle2 className="h-3 w-3" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteFolder(folder.id); }}
+                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded-lg bg-[var(--glass-subtle)] flex items-center justify-center text-zinc-500 hover:text-red-400 transition-all"
+                  title="删除"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </div>
+
+              {/* Papers */}
+              {expandedFolders.has(folder.id) && (
+                <div className="ml-5 mt-1 space-y-0.5">
+                  {folder.papers.map((paper, idx) => (
+                    <div
+                      key={paper.id}
+                      data-testid={`library-paper-${paper.id}`}
+                      aria-selected={selectedPapers.includes(paper.id)}
+                      className={`library-source-card flex items-start gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer transition-all duration-300 group animate-fade-in-up ${
+                        selectedPapers.includes(paper.id)
+                          ? 'library-source-card-selected'
+                          : ''
+                      }`}
+                      style={{ animationDelay: `${idx * 40}ms` }}
+                      onClick={() => togglePaperSelection(paper.id)}
+                      onContextMenu={(e) => handleContextMenu(e, paper)}
+                    >
+                      {/* Checkbox */}
+                      <div className="mt-0.5 flex-shrink-0">
+                        {selectedPapers.includes(paper.id) ? (
+                          <CheckCircle2 className="h-4 w-4 text-blue-400" />
+                        ) : (
+                          <Circle className="h-4 w-4 text-[var(--text-tertiary)] group-hover:text-[var(--text-secondary)] transition-colors" />
+                        )}
+                      </div>
+
+                      <FileTypeIcon fileType={paper.fileType} />
+
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[13px] truncate font-medium text-[var(--text-primary)] leading-tight">{paper.title}</p>
+                        <p className="text-[11px] text-[var(--text-secondary)] mt-1 truncate">
+                          {paper.authors.join(', ')} · {paper.year}
+                        </p>
+                        <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded-md font-semibold border ${fileTypeBadgeStyle(paper.fileType)}`}>
+                            {paper.fileType.toUpperCase()}
+                          </span>
+                          {(() => {
+                            const badge = ingestionBadge(paper);
+                            return badge ? (
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded-md font-semibold border ${badge.className}`}>
+                                {badge.label}
+                              </span>
+                            ) : null;
+                          })()}
+                          {(() => {
+                            const badge = mineruBadge(paper);
+                            return badge ? (
+                              <span className={`text-[9px] px-1.5 py-0.5 rounded-md font-semibold border ${badge.className}`}>
+                                {badge.label}
+                              </span>
+                            ) : null;
+                          })()}
+                          <span className="text-[10px] text-[var(--text-tertiary)]">{formatFileSize(paper.fileSize)}</span>
+                          {paper.keywords.length > 0 && (
+                            <span className="text-[10px] text-[var(--text-tertiary)] truncate">
+                              · {paper.keywords.slice(0, 2).join(', ')}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* More button */}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleContextMenu(e, paper); }}
+                        className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded-lg flex items-center justify-center text-zinc-600 hover:text-[var(--text-primary)] hover:bg-[var(--bg-card)] transition-all mt-0.5"
+                      >
+                        <MoreHorizontal className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Bottom upload area */}
+      <div className="px-4 py-4 border-t border-[var(--border-subtle)]">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={ACCEPT_STRING}
+          multiple
+          className="hidden"
+          onChange={(e) => handleFileSelect(e.target.files)}
+        />
+
+        <div
+          className="border border-dashed border-[var(--border-subtle)] rounded-2xl p-5 text-center cursor-pointer hover:border-[var(--border-hover)] hover:bg-[var(--glass-subtle)] transition-all duration-500"
+          onClick={() => fileInputRef.current?.click()}
+        >
+          <Upload className="h-6 w-6 mx-auto mb-2 text-[var(--text-quaternary)]" />
+          <p className="text-xs font-medium text-[var(--text-tertiary)]">拖拽文件到此处上传</p>
+          <p className="text-[10px] text-[var(--text-quaternary)] mt-1">或点击选择文件</p>
+        </div>
+      </div>
+
+      {/* Create folder dialog */}
+      {isSourceGuideOpen && (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-[var(--bg-primary)]/62 p-4 backdrop-blur-sm animate-fade-in"
+          onClick={dismissSourceGuide}
+        >
+          <div
+            className="liquid-glass-card max-h-[92vh] w-[min(560px,100%)] overflow-y-auto rounded-3xl p-6 animate-scale-in"
+            onClick={(event) => event.stopPropagation()}
+            data-testid="source-guide-modal"
+          >
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <p className="mb-2 text-xs font-semibold text-[var(--accent-blue)]">添加来源</p>
+                <h3 className="text-2xl font-semibold tracking-tight text-[var(--text-primary)]">先把资料放进工作台</h3>
+                <p className="mt-2 text-sm leading-relaxed text-[var(--text-secondary)]">
+                  上传文件或粘贴文本后，系统会解析、切片、建立索引，随后资料对话和 Studio 产物都会复用同一组来源。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={dismissSourceGuide}
+                className="liquid-glass-btn !p-2"
+                aria-label="关闭添加来源"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={openFilePickerFromGuide}
+                className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--glass-subtle)] p-4 text-left transition hover:border-[var(--accent-blue)] hover:bg-[var(--glass-active)]"
+                data-testid="source-guide-upload"
+              >
+                <Upload className="mb-4 h-5 w-5 text-[var(--accent-blue)]" />
+                <span className="block text-sm font-semibold text-[var(--text-primary)]">上传文件</span>
+                <span className="mt-1 block text-xs leading-relaxed text-[var(--text-tertiary)]">PDF、Word、PPT、TXT、图片、表格；上传后自动进入摄取和索引。</span>
+              </button>
+              <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--glass-subtle)] p-4">
+                <ClipboardPaste className="mb-4 h-5 w-5 text-emerald-400" />
+                <span className="block text-sm font-semibold text-[var(--text-primary)]">粘贴文本</span>
+                <input
+                  value={pastedSourceTitle}
+                  onChange={(event) => setPastedSourceTitle(event.target.value)}
+                  placeholder="资料标题，可选"
+                  className="liquid-glass-input mt-3 text-xs"
+                />
+                <textarea
+                  value={pastedSourceText}
+                  onChange={(event) => setPastedSourceText(event.target.value)}
+                  placeholder="把会议纪要、网页片段或研究笔记粘贴到这里..."
+                  className="liquid-glass-input mt-2 min-h-24 resize-none text-xs leading-relaxed"
+                />
+                <button
+                  type="button"
+                  onClick={handlePasteTextAsSource}
+                  disabled={!pastedSourceText.trim()}
+                  className="liquid-glass-btn-primary mt-3 w-full rounded-xl py-2 text-xs disabled:cursor-not-allowed disabled:opacity-45"
+                  data-testid="source-guide-paste-submit"
+                >
+                  添加为资料
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--glass-subtle)] p-4 opacity-75">
+                <Globe2 className="mb-4 h-5 w-5 text-cyan-400" />
+                <span className="block text-sm font-semibold text-[var(--text-primary)]">网页 / 快速研究</span>
+                <span className="mt-1 block text-xs leading-relaxed text-[var(--text-tertiary)]">后续接入抓取与搜索任务；当前先用上传或粘贴文本保证来源可审计。</span>
+              </div>
+              <div className="rounded-2xl border border-[var(--border-subtle)] bg-[var(--glass-subtle)] p-4">
+                <FileText className="mb-4 h-5 w-5 text-violet-400" />
+                <span className="block text-sm font-semibold text-[var(--text-primary)]">生成后怎么验证</span>
+                <span className="mt-1 block text-xs leading-relaxed text-[var(--text-tertiary)]">看上传进度、来源片段数、索引状态；选中来源后再进行对话、语音摘要、简报或报告。</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Create folder dialog */}
+      {isCreatingFolder && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[var(--bg-primary)]/60 backdrop-blur-sm animate-fade-in" onClick={() => setIsCreatingFolder(false)}>
+          <div className="liquid-glass-card w-[300px] p-6 animate-scale-in" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold text-[var(--text-primary)] mb-2">新建项目</h3>
+            <p className="text-xs text-zinc-500 mb-4">创建文件夹来组织您的资料</p>
+            <input
+              type="text"
+              placeholder="项目名称..."
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleCreateFolder()}
+              className="liquid-glass-input mb-4"
+              autoFocus
+            />
+            <div className="flex gap-2">
+              <button onClick={() => setIsCreatingFolder(false)} className="liquid-glass-btn flex-1 py-2 text-xs">取消</button>
+              <button onClick={handleCreateFolder} className="liquid-glass-btn !bg-gradient-to-r !from-blue-500 !to-blue-600 hover:!from-blue-400 hover:!to-blue-500 !text-white !border-0 flex-1 py-2 text-xs">创建</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Context menu */}
+      {contextMenu && (
+        <div
+          className="fixed z-[100] liquid-glass-card py-1.5 min-w-[180px] animate-scale-in"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => copyShortName(contextMenu.paper)}
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-zinc-300 hover:bg-[var(--glass-hover)] transition-colors"
+          >
+            <Copy className="h-3.5 w-3.5 text-zinc-500" />
+            复制资料简称 [{contextMenu.paper.shortName}]
+          </button>
+          <div className="h-px bg-[var(--border-subtle)] my-1" />
+          <button
+            className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-red-400 hover:bg-red-500/10 transition-colors"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            移除资料
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

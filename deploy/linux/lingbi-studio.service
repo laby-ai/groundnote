@@ -1,0 +1,21 @@
+[Unit]
+Description=Lingbi Studio NotebookLM-like Workbench
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lingbi-studio
+EnvironmentFile=/opt/lingbi-studio/.env.production
+ExecStart=/opt/lingbi-studio/start.sh
+Restart=always
+RestartSec=5
+User=lingbi
+Group=lingbi
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/lingbi-studio/.data /opt/lingbi-studio/logs
+
+[Install]
+WantedBy=multi-user.target

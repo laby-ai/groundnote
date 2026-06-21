@@ -1,0 +1,62 @@
+import { mkdir, readFile, rename, writeFile } from 'fs/promises';
+import path from 'path';
+import {
+  DEFAULT_SOURCE_STORE_PATH,
+  type SourceStoreAdapter,
+  type SourceStoreAdapterStatus,
+  type SourceStoreFile,
+} from '@/lib/source-store/types';
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+export class LocalJsonSourceStoreAdapter implements SourceStoreAdapter {
+  private writeQueue = Promise.resolve();
+
+  private sourceStorePath(): string {
+    const configured = process.env.SOURCE_STORE_PATH?.trim();
+    return path.resolve(process.cwd(), configured || DEFAULT_SOURCE_STORE_PATH);
+  }
+
+  async read(): Promise<SourceStoreFile> {
+    const targetPath = this.sourceStorePath();
+    try {
+      const raw = await readFile(targetPath, 'utf-8');
+      const parsed = JSON.parse(raw) as SourceStoreFile;
+      if (parsed.version === 1 && Array.isArray(parsed.sources)) return parsed;
+    } catch {
+      // Missing or invalid store files are recreated on the next write.
+    }
+
+    return { version: 1, updatedAt: nowIso(), sources: [] };
+  }
+
+  private async write(store: SourceStoreFile): Promise<void> {
+    const targetPath = this.sourceStorePath();
+    await mkdir(path.dirname(targetPath), { recursive: true });
+    const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmpPath, `${JSON.stringify(store, null, 2)}\n`, 'utf-8');
+    await rename(tmpPath, targetPath);
+  }
+
+  async mutate(mutator: (store: SourceStoreFile) => SourceStoreFile | Promise<SourceStoreFile>): Promise<SourceStoreFile> {
+    const nextWrite = this.writeQueue.then(async () => {
+      const current = await this.read();
+      const updated = await mutator(current);
+      updated.updatedAt = nowIso();
+      await this.write(updated);
+      return updated;
+    });
+    this.writeQueue = nextWrite.then(() => undefined, () => undefined);
+    return nextWrite;
+  }
+
+  status(): SourceStoreAdapterStatus {
+    return {
+      provider: 'local-json',
+      configured: true,
+      path: this.sourceStorePath(),
+    };
+  }
+}

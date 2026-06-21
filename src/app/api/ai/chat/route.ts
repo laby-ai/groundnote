@@ -1,0 +1,129 @@
+import { NextRequest } from 'next/server';
+import { llmStream, SYSTEM_PROMPTS } from '@/lib/ai-service';
+import type { RuntimeAIConfig } from '@/types';
+import type { RagSourceInput } from '@/lib/rag';
+import { buildGroundedRetrievalContext, toRetrievalMetadata } from '@/lib/grounded-retrieval';
+import { auditCitationMarkers } from '@/lib/citation-audit';
+import { resolveServerRuntimeAIConfig } from '@/lib/runtime-ai-config';
+
+export async function POST(request: NextRequest) {
+  try {
+    const { message, papers, mode, aiConfig, maxTokens, debugRetrievalOnly, debugAnswerText } = await request.json() as {
+      message?: string;
+      papers?: RagSourceInput[];
+      mode?: string;
+      aiConfig?: Partial<RuntimeAIConfig>;
+      maxTokens?: number;
+      debugRetrievalOnly?: boolean;
+      debugAnswerText?: string;
+    };
+
+    if (!message) {
+      return new Response(JSON.stringify({ error: '缺少消息内容' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const runtimeConfig = resolveServerRuntimeAIConfig(aiConfig);
+    const grounded = await buildGroundedRetrievalContext(message, papers || [], runtimeConfig);
+
+    if (debugRetrievalOnly) {
+      return new Response(JSON.stringify({
+        success: true,
+        citations: grounded.citations,
+        retrieval: toRetrievalMetadata(grounded),
+        promptContextLength: grounded.promptContext.length,
+        citationAudit: typeof debugAnswerText === 'string'
+          ? auditCitationMarkers(debugAnswerText, grounded.citations)
+          : undefined,
+      }), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+      });
+    }
+
+    const systemPrompt = mode === 'report'
+      ? SYSTEM_PROMPTS.reportGeneration
+      : SYSTEM_PROMPTS.academicQA;
+    const boundedMaxTokens = Number.isInteger(maxTokens) && typeof maxTokens === 'number'
+      ? Math.min(Math.max(maxTokens, 1), 4096)
+      : undefined;
+    const llmTimeoutMs = Math.max(10_000, Number(process.env.CHAT_LLM_TIMEOUT_MS || 60_000));
+
+    const citationRules = grounded.citations.length > 0
+      ? [
+          '引用规则：',
+          '- 回答中必须至少出现一个引用编号，例如 [1]。',
+          '- 每个关键事实句或结论句尾必须标注对应证据编号，如 [1] 或 [1][2]。',
+          '- 只能使用上方证据片段中存在的编号，不要编造未给出的来源。',
+          '- 如果证据不足，先说明不足，再引用最相关的已有证据。',
+        ].join('\n')
+      : '';
+
+    const messages = [
+      { role: 'system' as const, content: systemPrompt },
+      ...(grounded.promptContext ? [{
+        role: 'user' as const,
+        content: `以下是从当前资料库检索出的证据片段。回答必须优先基于这些片段。\n\n${citationRules}\n\n${grounded.promptContext}`,
+      }] : []),
+      {
+        role: 'user' as const,
+        content: grounded.citations.length > 0
+          ? `请回答用户问题，并严格遵守上方引用规则。\n\n用户问题：${message}`
+          : message,
+      },
+    ];
+
+    // Stream response as SSE
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        const llmSignal = AbortSignal.timeout(llmTimeoutMs);
+        try {
+          let answerText = '';
+          if (grounded.citations.length > 0) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              citations: grounded.citations,
+              retrieval: toRetrievalMetadata(grounded),
+            })}\n\n`));
+          }
+          for await (const chunk of llmStream(messages, {
+            model: 'doubao-seed-2-0-pro-260215',
+            temperature: mode === 'report' ? 0.5 : 0.3,
+            maxTokens: boundedMaxTokens,
+            signal: llmSignal,
+          }, undefined, runtimeConfig)) {
+            answerText += chunk;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content: chunk })}\n\n`));
+          }
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            citationAudit: auditCitationMarkers(answerText, grounded.citations),
+          })}\n\n`));
+          controller.enqueue(encoder.encode(`data: [DONE]\n\n`));
+          controller.close();
+        } catch (err) {
+          const timedOut = llmSignal.aborted || (err instanceof Error && /abort|timeout|timed out/i.test(err.message));
+          const msg = timedOut
+            ? `真实模型生成超过 ${Math.round(llmTimeoutMs / 1000)} 秒，已停止等待。请稍后重试或缩短问题。`
+            : err instanceof Error ? err.message : '生成失败';
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: msg })}\n\n`));
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      },
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : '服务错误';
+    return new Response(JSON.stringify({ error: msg }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+}

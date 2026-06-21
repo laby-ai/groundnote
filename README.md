@@ -1,6 +1,6 @@
-# GroundNote
+# KnowTrail
 
-GroundNote 是一个 NotebookLM-style 的开源资料工作台，面向资料上传、引用问答、综述报告、知识卡片、资料地图、演示文稿和语音摘要等工作流。中文产品名为“灵笔工作室”，默认支持用户自带 OpenAI-compatible API Base / API Key，也支持部署方配置服务端默认模型。
+KnowTrail 是一个 NotebookLM-style 的开源资料工作台，面向资料上传、引用问答、综述报告、知识卡片、资料地图、演示文稿和语音摘要等工作流。中文产品名为“灵笔工作室”，默认支持用户自带 OpenAI-compatible API Base / API Key，也支持部署方配置服务端默认模型。
 
 ## 发布版本能力
 
